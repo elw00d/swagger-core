@@ -1,19 +1,20 @@
 package com.wordnik.swagger.jaxrs.reader
 
-import com.wordnik.swagger.model._
-import com.wordnik.swagger.jaxrs._
-import com.wordnik.swagger.config._
-import com.wordnik.swagger.core.util.ModelUtil
-import com.wordnik.swagger.annotations._
-import com.wordnik.swagger.core.ApiValues._
-
-import java.lang.reflect.{ Method, Type }
 import java.lang.annotation.Annotation
-
+import java.lang.reflect
+import java.lang.reflect.Method
 import javax.ws.rs._
 import javax.ws.rs.core.Context
 
-import scala.collection.mutable.{ ListBuffer, HashMap, HashSet }
+import com.wordnik.swagger.annotations._
+import com.wordnik.swagger.config._
+import com.wordnik.swagger.core.ApiValues._
+import com.wordnik.swagger.core.util.ModelUtil
+import com.wordnik.swagger.jaxrs._
+import com.wordnik.swagger.model._
+
+import scala.collection.immutable
+import scala.collection.mutable.ListBuffer
 
 class DefaultJaxrsApiReader extends JaxrsApiReader {
   def readRecursive(
@@ -123,6 +124,60 @@ class DefaultJaxrsApiReader extends JaxrsApiReader {
     var shouldIgnore = false
     for (pa <- paramAnnotations) {
       pa match {
+        // Для BeanParam-параметра просто берём все сеттеры, помеченные одной из обычных params-аннотаций,
+        // и рекурсивно получаем для них списки параметров. После этого возвращаем соединённые списки наверх
+        case e: BeanParam => {
+          val beanClass = Class.forName(mutable.dataType)
+          val methods: Array[Method] = beanClass.getMethods
+
+          // Это замыкание конвертирует метод внутри BeanParam-класса в кортеж аргументов
+          // для processParamAnnotations или в null, если метод нам не интересен
+          // (нет аннотации, не сеттер). Сеттер должен иметь один параметр и не иметь возвращаемого значения.
+          val clojure : (Method) => (MutableParameter, Array[Annotation]) = (m) => {
+            val annotations: Array[Annotation] = m.getAnnotations
+            if (annotations.nonEmpty) {
+              val supportedAnnotations: immutable.HashSet[Class[_]] = immutable.HashSet[Class[_]] (
+                classOf[ApiParam],
+                classOf[QueryParam],
+                classOf[PathParam],
+                classOf[MatrixParam],
+                classOf[HeaderParam],
+                classOf[FormParam],
+                classOf[CookieParam],
+                classOf[DefaultValue],
+                classOf[Context]
+              )
+
+              val filteredAnnotations: Array[Annotation] = annotations.filter(a => supportedAnnotations.contains(a.annotationType()))
+              if (filteredAnnotations.nonEmpty) {
+                // todo : check return type is void
+                // todo : check parameters count is 1
+                val param: reflect.Parameter = m.getParameters.lift(0).orNull
+                if (null != param) {
+                  val mutableParam = new MutableParameter
+                  mutableParam.dataType = processDataType(param.getType, param.getParameterizedType)
+                  mutableParam.allowableValues = processAllowableValues(param.getType, param.getParameterizedType)
+
+                  (mutableParam, filteredAnnotations)
+                } else {
+                  null
+                }
+              } else {
+                null
+              }
+            } else {
+              null
+            }
+          }
+
+          val map: Array[(MutableParameter, Array[Annotation])] = methods.map(clojure)
+          val list: List[(MutableParameter, Array[Annotation])] = map.filter(i => i != null).toList
+          if (list.isEmpty) return List.empty[Parameter]
+          val allParams: List[Parameter] = list.map(tuple => {
+            processParamAnnotations(tuple._1, tuple._2)
+          }).reduce((a: List[Parameter], b: List[Parameter]) => List.concat(a, b))
+          return allParams
+        }
         case e: ApiParam => parseApiParamAnnotation(mutable, e)
         case e: QueryParam => {
           mutable.name = readString(e.value, mutable.name)
